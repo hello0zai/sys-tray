@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "sys-tray"
+version = "0.1.0"
+description = ""
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+psutil = "^7.2.2"
+pywin32 = "^312"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

@@ -3,6 +3,7 @@ Minimal Windows system-tray icon inspired by SABnzbd's sabtraywin.py
 + server status + background workers + process management
 """
 import os 
+import sys 
 import json
 import logging
 import os
@@ -23,11 +24,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def get_running_path():    
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    else:
+        return os.path.dirname(os.path.abspath(__file__))
+
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
 WINDOW_CLASS_NAME = "MyTrayIconDemo"
-ICON_PATH = os.path.abspath("icon.ico")   # or None for default system icon
+print("type", type(get_running_path()), get_running_path())
+ICON_PATH = os.path.join(get_running_path(), "icon.ico")   # or None for default system icon
 APP_NAME = "SABnzbd Demo"
 
 SERVER_COMMAND = [
@@ -627,7 +636,7 @@ class TrayIcon(threading.Thread):
 # ----------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------
-if __name__ == "__main__":
+def main():
     print("System tray icon started. Right-click the icon in the tray.")
 
     try:

@@ -2,3 +2,5 @@
 build
 dist
 .vscode
+__pycache__
+*.log

@@ -2,48 +2,84 @@
 Minimal Windows system-tray icon inspired by SABnzbd's sabtraywin.py
 + server status + background workers + process management
 """
-import os 
-import sys 
 import json
 import logging
 import os
 import subprocess
+import sys
 import threading
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
+import psutil
+import pywintypes
 import win32con
 import win32gui
 import win32gui_struct
-import pywintypes
-import psutil
 from dotenv import load_dotenv
 
-load_dotenv()
 
-
-def get_running_path():    
-    if getattr(sys, 'frozen', False):
+# ----------------------------------------------------------------------
+# Paths / environment
+# ----------------------------------------------------------------------
+def get_running_path() -> str:
+    """Folder of the exe (frozen) or of this script."""
+    if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
-    else:
-        return os.path.dirname(os.path.abspath(__file__))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+RUNNING_PATH = get_running_path()
+
+# Load .env from next to the exe/script (not from the current working dir,
+# which is unreliable when started from Startup/Task Scheduler/PyInstaller).
+load_dotenv(os.path.join(RUNNING_PATH, ".env"))
+
+
+def find_icon() -> str | None:
+    candidates = [os.path.join(RUNNING_PATH, "icons/icon.ico")]
+    bundle_dir = getattr(sys, "_MEIPASS", None)  # PyInstaller --onefile temp dir
+    if bundle_dir:
+        candidates.append(os.path.join(bundle_dir, "icons/icon.ico"))
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+# ----------------------------------------------------------------------
+# Logging (file + console). The file log matters for --noconsole builds,
+# where there is no stdout to look at.
+# ----------------------------------------------------------------------
+handlers: list[logging.Handler] = []
+try:
+    handlers.append(logging.FileHandler(os.path.join(RUNNING_PATH, "tray.log"), encoding="utf-8"))
+except OSError:
+    pass
+if sys.stderr is not None:
+    handlers.append(logging.StreamHandler())
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
+    handlers=handlers,
+)
+
 
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
 WINDOW_CLASS_NAME = "MyTrayIconDemo"
-print("type", type(get_running_path()), get_running_path())
-ICON_PATH = os.path.join(get_running_path(), "icon.ico")   # or None for default system icon
 APP_NAME = "SABnzbd Demo"
 
-SERVER_COMMAND = [
-    os.getenv("SERVER"),
-]
+SERVER=r"C:\Users\wan\AppData\Local\Programs\Sundial\sd-server.exe"
+SERVER_ENDPOINT="http://127.0.0.1:7600/api/0/info"
 
-SERVER_ENDPOINT = os.getenv("SERVER_ENDPOINT")
+# SERVER = os.getenv("SERVER")
+SERVER_COMMAND = [SERVER] if SERVER else []
+# SERVER_ENDPOINT = os.getenv("SERVER_ENDPOINT")
 SETTINGS_ENDPOINT = "https://dummyjson.com/quotes"
 
 SERVER_CHECK_INTERVAL = 60
@@ -58,31 +94,23 @@ WM_TRAY = win32con.WM_USER + 20
 WM_STATUS_UPDATED = win32con.WM_APP + 1
 WM_SETTINGS_UPDATED = win32con.WM_APP + 2
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-
 # Shared state
 stop_event = threading.Event()
-server_status = None          # None = Checking, True/False = Connected/Disconnected
+server_status = None  # None = Checking, True/False = Connected/Disconnected
 server_status_lock = threading.Lock()
 latest_settings = None
 settings_lock = threading.Lock()
 server_check_lock = threading.Lock()
 settings_request_lock = threading.Lock()
 
-tray_app = None
+tray_app = None  # assigned in main() via `global`
 
 
 # ----------------------------------------------------------------------
 # HTTP helpers
 # ----------------------------------------------------------------------
 def get_json(url: str):
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "TrayDemo/1.0"},
-    )
+    request = urllib.request.Request(url, headers={"User-Agent": "TrayDemo/1.0"})
     with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
         if response.status != 200:
             raise RuntimeError(f"HTTP {response.status}")
@@ -113,11 +141,11 @@ def fetch_settings():
 # ----------------------------------------------------------------------
 def get_server_executable() -> Path:
     if not SERVER_COMMAND:
-        raise ValueError("SERVER_COMMAND cannot be empty.")
+        raise ValueError("SERVER is not set (SERVER_COMMAND is empty).")
     return Path(SERVER_COMMAND[0]).resolve()
 
 
-def find_server_processes():
+def find_server_processes() -> list[psutil.Process]:
     executable = get_server_executable()
     matches = []
     for process in psutil.process_iter(["pid", "name", "exe"]):
@@ -128,6 +156,46 @@ def find_server_processes():
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             continue
     return matches
+
+
+def stop_server_processes() -> bool:
+    """Terminate the server and its children. Returns True if nothing is left."""
+    processes = find_server_processes()
+    if not processes:
+        return True
+
+    # Include child processes, otherwise terminating only the parent can leave
+    # orphans that keep the port busy.
+    targets: dict[int, psutil.Process] = {}
+    for proc in processes:
+        targets[proc.pid] = proc
+        try:
+            for child in proc.children(recursive=True):
+                targets[child.pid] = child
+        except psutil.Error:
+            pass
+
+    for proc in targets.values():
+        try:
+            proc.terminate()
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.AccessDenied:
+            logging.error("Access denied terminating PID %s.", proc.pid)
+
+    _, alive = psutil.wait_procs(list(targets.values()), timeout=PROCESS_STOP_TIMEOUT)
+    for proc in alive:
+        try:
+            logging.warning("Force-killing unresponsive PID %s.", proc.pid)
+            proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    _, alive = psutil.wait_procs(alive, timeout=3)
+    if alive:
+        logging.error("Could not stop PIDs: %s", [p.pid for p in alive])
+        return False
+    return True
 
 
 def wait_for_server(timeout: float) -> bool:
@@ -181,31 +249,13 @@ def restart_server() -> bool:
     if stop_event.is_set():
         return False
 
-    processes = find_server_processes()
-    if processes:
-        logging.warning("Server endpoint failed. Restarting %s matching process(es).", len(processes))
-        for process in processes:
-            try:
-                process.terminate()
-            except psutil.NoSuchProcess:
-                pass
-            except psutil.AccessDenied:
-                logging.exception("Cannot terminate server PID %s.", process.pid)
-                return False
-
-        _, alive = psutil.wait_procs(processes, timeout=PROCESS_STOP_TIMEOUT)
-        for process in alive:
-            try:
-                logging.warning("Force-stopping unresponsive server PID %s.", process.pid)
-                process.kill()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-
-        _, alive = psutil.wait_procs(alive, timeout=3)
-        if alive:
-            logging.error("Server process could not be stopped.")
+    if find_server_processes():
+        logging.warning("Server endpoint failed. Restarting existing server process(es).")
+        if not stop_server_processes():
             return False
 
+    if stop_event.is_set():
+        return False
     if check_server():
         logging.info("Server recovered without a new launch.")
         return True
@@ -224,26 +274,30 @@ def publish_server_status(status: bool):
         tray_app.post_message(WM_STATUS_UPDATED)
 
 
+def _check_and_recover():
+    """Check the server; if it is down, try to recover. Caller holds server_check_lock."""
+    status = check_server()
+    publish_server_status(status)
+
+    if status:
+        logging.info("Server status: Connected")
+        return
+
+    logging.warning("Server status: Disconnected - attempting recovery")
+    if stop_event.is_set():
+        return
+    recovered = restart_server()
+    status = check_server() if recovered and not stop_event.is_set() else False
+    publish_server_status(status)
+    logging.info("Server status after recovery: %s", "Connected" if status else "Disconnected")
+
+
 def server_worker():
     """Periodic health check + automatic recovery."""
     while not stop_event.is_set():
         if server_check_lock.acquire(blocking=False):
             try:
-                status = check_server()
-                publish_server_status(status)
-
-                if status:
-                    logging.info("Server status: Connected")
-                else:
-                    logging.warning("Server status: Disconnected – attempting recovery")
-                    if not stop_event.is_set():
-                        recovered = restart_server()
-                        status = check_server() if recovered and not stop_event.is_set() else False
-                        publish_server_status(status)
-                        logging.info(
-                            "Server status after recovery: %s",
-                            "Connected" if status else "Disconnected",
-                        )
+                _check_and_recover()
             except Exception:
                 logging.exception("server_worker error")
                 publish_server_status(False)
@@ -262,14 +316,7 @@ def server_worker_once():
         logging.info("Server check already running")
         return
     try:
-        status = check_server()
-        publish_server_status(status)
-        logging.info("Manual server status: %s", "Connected" if status else "Disconnected")
-
-        if not status and not stop_event.is_set():
-            recovered = restart_server()
-            status = check_server() if recovered and not stop_event.is_set() else False
-            publish_server_status(status)
+        _check_and_recover()
     except Exception:
         logging.exception("Manual server check failed")
         publish_server_status(False)
@@ -277,87 +324,77 @@ def server_worker_once():
         server_check_lock.release()
 
 
+def _refresh_settings_once():
+    global latest_settings
+    if not settings_request_lock.acquire(blocking=False):
+        logging.info("Settings request already running")
+        return
+    try:
+        settings = fetch_settings()
+        if settings is not None:
+            with settings_lock:
+                latest_settings = settings
+            if tray_app is not None:
+                tray_app.post_message(WM_SETTINGS_UPDATED)
+    except Exception:
+        logging.exception("settings refresh error")
+    finally:
+        settings_request_lock.release()
+
+
 def settings_worker():
     """Periodic settings refresh."""
-    global latest_settings
     while not stop_event.is_set():
-        if settings_request_lock.acquire(blocking=False):
-            try:
-                settings = fetch_settings()
-                print(settings)
-                if settings is not None:
-                    with settings_lock:
-                        latest_settings = settings
-                    if tray_app is not None:
-                        tray_app.post_message(WM_SETTINGS_UPDATED)
-            except Exception:
-                logging.exception("settings_worker error")
-            finally:
-                settings_request_lock.release()
-
+        _refresh_settings_once()
         if stop_event.wait(SETTINGS_CHECK_INTERVAL):
             break
 
 
 def refresh_settings_async():
-    def worker():
-        global latest_settings
-        if not settings_request_lock.acquire(blocking=False):
-            logging.info("Settings request already running")
-            return
-        try:
-            settings = fetch_settings()
-            if settings is not None:
-                with settings_lock:
-                    latest_settings = settings
-                if tray_app is not None:
-                    tray_app.post_message(WM_SETTINGS_UPDATED)
-        finally:
-            settings_request_lock.release()
-
-    threading.Thread(target=worker, name="SettingsRefresh", daemon=True).start()
+    threading.Thread(target=_refresh_settings_once, name="SettingsRefresh", daemon=True).start()
 
 
 # ----------------------------------------------------------------------
 # Menu actions
 # ----------------------------------------------------------------------
 def show_interface():
-    print("→ Show interface")
+    logging.info("Show interface")
 
 
 def open_complete_folder():
-    print("→ Open complete folder")
+    logging.info("Open complete folder")
 
 
 def pause_resume():
-    print("→ Pause / Resume toggled")
+    logging.info("Pause / Resume toggled")
 
 
 def pause_for(minutes: int):
-    print(f"→ Pause for {minutes} minutes")
+    logging.info("Pause for %s minutes", minutes)
 
 
 def read_rss():
-    print("→ Read all RSS feeds")
+    logging.info("Read all RSS feeds")
 
 
 def restart():
-    print("→ Restart")
+    logging.info("Restart")
 
 
 def restart_no_login():
-    print("→ Restart without login")
+    logging.info("Restart without login")
 
 
 def restart_localhost():
-    print("→ Restart - 127.0.0.1:8080")
+    logging.info("Restart - 127.0.0.1:8080")
 
 
 def shutdown():
-    print("→ Shutdown requested")
-    stop_event.set()
+    logging.info("Shutdown requested")
     if tray_app is not None:
         tray_app.stop()
+    else:
+        stop_event.set()
 
 
 # ----------------------------------------------------------------------
@@ -365,12 +402,15 @@ def shutdown():
 # ----------------------------------------------------------------------
 class TrayIcon(threading.Thread):
     def __init__(self):
-        super().__init__(daemon=True)
+        super().__init__(name="Tray", daemon=True)
         self.terminate = False
         self.hwnd = None
         self.menu = None
         self.notify_id = None
         self.hicon = None
+        self.ready = threading.Event()  # set once the window/icon creation attempt is done
+        self._stop_lock = threading.Lock()
+        self._stopped = False
 
         raw_menu = [
             ("Server: Checking...", None),
@@ -410,7 +450,7 @@ class TrayIcon(threading.Thread):
         self.menu_options = self._assign_ids(raw_menu, iter(range(1, 1000)))
 
         self.status_cmd_id = None
-        for text, action, cmd_id in self.menu_options:
+        for text, _action, cmd_id in self.menu_options:
             if text.startswith("Server:"):
                 self.status_cmd_id = cmd_id
                 break
@@ -431,54 +471,81 @@ class TrayIcon(threading.Thread):
                 result.append((text, None, cmd_id))
         return result
 
+    # ------------------------------------------------------------------
+    # Thread body: everything touching the window lives on THIS thread
+    # ------------------------------------------------------------------
     def run(self):
-        self._create_window()
-        self._create_menu()
-        self._add_icon()
+        try:
+            self._create_window()
+            self._create_menu()
+            self._add_icon()
+        except Exception:
+            # Without this, a failure here kills the thread silently
+            # and you just never see an icon.
+            logging.exception("Tray setup failed")
+            self.terminate = True
+        finally:
+            self.ready.set()
 
-        while not self.terminate:
-            win32gui.PumpWaitingMessages()
-            time.sleep(0.05)
+        try:
+            while not self.terminate:
+                win32gui.PumpWaitingMessages()
+                time.sleep(0.05)
+        except Exception:
+            logging.exception("Tray message loop crashed")
+        finally:
+            self._cleanup()
 
+    def _cleanup(self):
         if self.notify_id:
             try:
                 win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, self.notify_id)
             except Exception:
                 pass
+            self.notify_id = None
         if self.menu:
-            win32gui.DestroyMenu(self.menu)
+            try:
+                win32gui.DestroyMenu(self.menu)
+            except Exception:
+                pass
+            self.menu = None
+        if self.hwnd and win32gui.IsWindow(self.hwnd):
+            try:
+                win32gui.DestroyWindow(self.hwnd)
+            except Exception:
+                pass
+        self.hwnd = None
 
     def stop(self):
-        self.terminate = True
-        stop_event.set()
-        exe_name = Path(SERVER_COMMAND[0]).name
-        
-        try:
-            result = subprocess.run(
-                ["taskkill", "/F", "/IM", exe_name],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-                shell=False,
-            )
+        """Safe to call from any thread, any number of times."""
+        with self._stop_lock:
+            if self._stopped:
+                return
+            self._stopped = True
 
-            if result.returncode == 0:
-                logging.info("Terminated %s.", exe_name)
-            else:
-                logging.warning(
-                    "taskkill failed: %s",
-                    result.stderr.strip() or result.stdout.strip(),
-                )
+            logging.info("Stopping tray and server...")
+            stop_event.set()  # tells workers not to start/restart anything
 
-        except (OSError, subprocess.TimeoutExpired):
-            logging.exception("Failed to terminate %s.", exe_name)
+            # Wait for an in-flight check/restart to notice stop_event, so it
+            # cannot spawn a new server behind our back.
+            got_lock = server_check_lock.acquire(timeout=PROCESS_STOP_TIMEOUT + STARTUP_TIMEOUT)
+            try:
+                try:
+                    stop_server_processes()
+                except Exception:
+                    logging.exception("Failed to stop server")
+            finally:
+                if got_lock:
+                    server_check_lock.release()
 
-        finally:
+            # Ask the tray thread to close its own window (DestroyWindow must
+            # be called from the thread that created the window).
+            self.terminate = True
             if self.hwnd:
-                win32gui.DestroyWindow(self.hwnd)
-                
-        time.sleep(0.2)
+                try:
+                    win32gui.PostMessage(self.hwnd, win32con.WM_CLOSE, 0, 0)
+                except Exception:
+                    pass
 
     def post_message(self, message):
         if self.hwnd and not self.terminate:
@@ -491,6 +558,7 @@ class TrayIcon(threading.Thread):
     def _create_window(self):
         message_map = {
             win32gui.RegisterWindowMessage("TaskbarCreated"): self._on_taskbar_created,
+            win32con.WM_CLOSE: self._on_close,
             win32con.WM_DESTROY: self._on_destroy,
             win32con.WM_COMMAND: self._on_command,
             WM_TRAY: self._on_notify,
@@ -506,7 +574,12 @@ class TrayIcon(threading.Thread):
         wc.hbrBackground = win32con.COLOR_WINDOW
         wc.lpfnWndProc = message_map
 
-        class_atom = win32gui.RegisterClass(wc)
+        try:
+            class_atom = win32gui.RegisterClass(wc)
+        except pywintypes.error as exc:
+            if exc.winerror != 1410:  # ERROR_CLASS_ALREADY_EXISTS
+                raise
+            class_atom = WINDOW_CLASS_NAME
 
         style = win32con.WS_OVERLAPPED | win32con.WS_SYSMENU
         self.hwnd = win32gui.CreateWindow(
@@ -518,13 +591,21 @@ class TrayIcon(threading.Thread):
         )
         win32gui.UpdateWindow(self.hwnd)
 
-        if ICON_PATH and os.path.isfile(ICON_PATH):
-            self.hicon = win32gui.LoadImage(
-                0, ICON_PATH, win32con.IMAGE_ICON, 0, 0,
-                win32con.LR_LOADFROMFILE | win32con.LR_DEFAULTSIZE,
-            )
+        self.hicon = self._load_icon()
+
+    def _load_icon(self):
+        icon_path = find_icon()
+        if icon_path:
+            try:
+                return win32gui.LoadImage(
+                    0, icon_path, win32con.IMAGE_ICON, 0, 0,
+                    win32con.LR_LOADFROMFILE | win32con.LR_DEFAULTSIZE,
+                )
+            except pywintypes.error:
+                logging.exception("Could not load %s, using default icon", icon_path)
         else:
-            self.hicon = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
+            logging.warning("icon.ico not found, using default icon")
+        return win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
 
     def _add_icon(self):
         flags = win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP
@@ -536,10 +617,9 @@ class TrayIcon(threading.Thread):
             self.hicon,
             APP_NAME,
         )
-        try:
-            win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, self.notify_id)
-        except Exception as e:
-            print("Failed to add tray icon:", e)
+        # Let this raise: run() logs it, which tells us exactly why no icon appears.
+        win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, self.notify_id)
+        logging.info("Tray icon added.")
 
     def _create_menu(self):
         self.menu = win32gui.CreatePopupMenu()
@@ -557,11 +637,7 @@ class TrayIcon(threading.Thread):
                 win32gui.InsertMenuItem(menu, 0, 1, item)
             else:
                 state = win32con.MFS_DISABLED if text.startswith("Server:") else 0
-                item, _ = win32gui_struct.PackMENUITEMINFO(
-                    text=text,
-                    wID=cmd_id,
-                    fState=state,
-                )
+                item, _ = win32gui_struct.PackMENUITEMINFO(text=text, wID=cmd_id, fState=state)
                 win32gui.InsertMenuItem(menu, 0, 1, item)
 
     def update_status_menu(self):
@@ -586,37 +662,49 @@ class TrayIcon(threading.Thread):
         win32gui.SetMenuItemInfo(self.menu, self.status_cmd_id, False, item)
 
     # ------------------------------------------------------------------
+    # Window message handlers (run on the tray thread)
+    # ------------------------------------------------------------------
     def _on_notify(self, hwnd, msg, wparam, lparam):
         if lparam == win32con.WM_RBUTTONUP:
             self.update_status_menu()
             self._show_menu()
         elif lparam == win32con.WM_LBUTTONDBLCLK:
-            show_interface()
-        return True
+            threading.Thread(target=show_interface, name="ShowInterface", daemon=True).start()
+        return 0
 
     def _on_command(self, hwnd, msg, wparam, lparam):
         cmd_id = win32gui.LOWORD(wparam)
-        if cmd_id in self.menu_actions_by_id:
-            self.menu_actions_by_id[cmd_id]()
-        return True
+        action = self.menu_actions_by_id.get(cmd_id)
+        if action:
+            # Run in a worker thread so slow actions (server restart,
+            # shutdown) never freeze the tray message loop.
+            threading.Thread(target=action, name=f"MenuAction-{cmd_id}", daemon=True).start()
+        return 0
 
     def _on_status_updated(self, hwnd, msg, wparam, lparam):
         self.update_status_menu()
-        return True
+        return 0
 
     def _on_settings_updated(self, hwnd, msg, wparam, lparam):
         logging.debug("Settings updated")
-        return True
+        return 0
 
     def _on_taskbar_created(self, hwnd, msg, wparam, lparam):
-        self.notify_id = None
-        self._add_icon()
-        return True
+        # Explorer restarted: the icon is gone, add it again.
+        try:
+            self._add_icon()
+        except Exception:
+            logging.exception("Could not re-add tray icon")
+        return 0
+
+    def _on_close(self, hwnd, msg, wparam, lparam):
+        win32gui.DestroyWindow(hwnd)
+        return 0
 
     def _on_destroy(self, hwnd, msg, wparam, lparam):
         self.terminate = True
-        stop_event.set()
-        return True
+        win32gui.PostQuitMessage(0)
+        return 0
 
     def _show_menu(self):
         try:
@@ -637,30 +725,45 @@ class TrayIcon(threading.Thread):
 # Entry point
 # ----------------------------------------------------------------------
 def main():
-    print("System tray icon started. Right-click the icon in the tray.")
+    global tray_app  # without this, tray_app stays None everywhere else
+
+    if not SERVER or not SERVER_ENDPOINT:
+        logging.error("SERVER and SERVER_ENDPOINT must be set in %s", os.path.join(RUNNING_PATH, ".env"))
+        raise SystemExit(1)
+
+    logging.info("System tray app starting. Right-click the icon in the tray.")
 
     try:
         executable = get_server_executable()
         if not executable.is_file():
             logging.warning(
-                "SERVER_COMMAND points to a missing file: %s  "
-                "(auto-restart will not work until you fix the path)",
+                "SERVER points to a missing file: %s (auto-restart will not work until you fix the path)",
                 executable,
             )
     except ValueError:
-        logging.exception("Invalid SERVER_COMMAND")
+        logging.exception("Invalid SERVER")
         raise SystemExit(1)
 
     tray_app = TrayIcon()
+    tray_app.ready.wait(timeout=10)
 
-    # Start the two background workers
+    if tray_app.terminate and not tray_app.is_alive():
+        logging.error("Tray icon could not be created. See errors above.")
+        raise SystemExit(1)
+
     threading.Thread(target=server_worker, name="ServerMonitor", daemon=True).start()
     threading.Thread(target=settings_worker, name="SettingsMonitor", daemon=True).start()
 
     try:
-        while not stop_event.is_set():
-            time.sleep(1)
+        while not stop_event.is_set() and tray_app.is_alive():
+            time.sleep(0.5)
     except KeyboardInterrupt:
-        print("\nExiting…")
-        stop_event.set()
+        logging.info("Exiting...")
+    finally:
+        # Idempotent: if Shutdown was clicked, this just waits for it to finish.
         tray_app.stop()
+        tray_app.join(timeout=3)
+
+
+if __name__ == "__main__":
+    main()
